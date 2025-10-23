@@ -13,3 +13,8 @@ Install libraries
 ```bash
 pip3 install -r requirements.txt
 ```
+
+```bash
+sudo apt update
+sudo apt install graphviz
+```
