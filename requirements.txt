@@ -2,5 +2,7 @@ numpy
 matplotlib
 scipy
 
+pygame
+
 # Circuit visualization
 graphviz
