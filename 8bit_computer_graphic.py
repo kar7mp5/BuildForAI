@@ -151,7 +151,8 @@ def opcode_to_name(opcode):
         (1, 1, 1, 0): "HLT",
         (0, 0, 0, 1): "CMP",
         (1, 0, 0, 1): "JE",
-        (0, 1, 0, 1): "JNE"
+        (0, 1, 0, 1): "JNE",
+        (1, 1, 0, 1): "STG"
     }
     return op_map.get(tuple(opcode), "UNKNOWN")
 
@@ -185,7 +186,7 @@ def draw_7_segment(screen, value, x, y, scale=1.0, color_on=(0, 255, 0), color_o
         color = color_on if on else color_off
         pygame.draw.line(screen, color, positions[i][0], positions[i][1], seg_height)
 
-# Parse user input program
+# Parse user input program (16-bit instructions: 4-bit opcode + 8-bit operand)
 def parse_program(input_str):
     op_map = {
         "NOP": 0b0000,
@@ -198,9 +199,10 @@ def parse_program(input_str):
         "HLT": 0b0111,
         "CMP": 0b1000,
         "JE": 0b1001,
-        "JNE": 0b1010
+        "JNE": 0b1010,
+        "STG": 0b1011
     }
-    ram = [0] * 256
+    ram = [0] * 512  # 256 instructions * 2 bytes each
     instructions = input_str.split(';')
     addr = 0
     for instr in instructions:
@@ -212,15 +214,16 @@ def parse_program(input_str):
         if op not in op_map:
             raise ValueError(f"Unknown instruction: {op}")
         opcode = op_map[op]
+        operand = 0
         if len(parts) > 1:
-            arg = int(parts[1])
-            if arg < 0 or arg > 15:
-                raise ValueError(f"Address/data {arg} out of range (0-15)")
-            ram[addr] = (opcode << 4) | arg
-        else:
-            ram[addr] = opcode << 4
-        addr += 1
-        if addr >= 16:
+            operand = int(parts[1])
+            if operand < 0 or operand > 255:
+                raise ValueError(f"Address/data {operand} out of range (0-255)")
+        # Store 16-bit instruction: 4-bit opcode + 8-bit operand
+        ram[addr] = (opcode << 4) | ((operand >> 4) & 0x0F)  # First byte: opcode + high 4 bits of operand
+        ram[addr + 1] = operand & 0xFF  # Second byte: low 8 bits of operand
+        addr += 2
+        if addr >= 512:
             break
     return ram
 
@@ -228,10 +231,12 @@ def parse_program(input_str):
 class CPU:
     def __init__(self, program):
         self.ram = parse_program(program)
-        self.ram[10] = 5
-        self.ram[11] = 3
-        self.ram[12] = 8
-        self.ram[13] = 9
+        # Preload pyramid pattern data
+        self.ram[40] = 0    # 0b00000000
+        self.ram[41] = 24   # 0b00011000
+        self.ram[42] = 60   # 0b00111100
+        self.ram[43] = 126  # 0b01111110
+        self.ram[44] = 255  # 0b11111111
         self.a_reg = [0] * 8
         self.b_reg = [0] * 8
         self.pc = [0] * 8
@@ -253,22 +258,28 @@ class CPU:
 
     def fetch(self, sim_clock):
         self.mar, _, self.mar_states = d_flip_flop_8bit_update(self.pc, sim_clock, self.mar_states)
-        addr = bits_to_int(self.mar)
-        if 0 <= addr < len(self.ram):
-            instr = self.ram[addr]
-            self.bus = int_to_bits_8(instr)
+        addr = bits_to_int(self.mar) * 2  # Each instruction is 2 bytes
+        if 0 <= addr < len(self.ram) - 1:
+            # Read 16-bit instruction
+            high_byte = self.ram[addr]
+            low_byte = self.ram[addr + 1]
+            instr = (high_byte << 8) | low_byte
+            self.bus = int_to_bits_8(high_byte)  # Only high byte for IR (opcode + partial operand)
         else:
             self.bus = [0] * 8
         self.ir, _, self.ir_states = d_flip_flop_8bit_update(self.bus, sim_clock, self.ir_states)
         pc_val = bits_to_int(self.pc)
         new_pc = int_to_bits_8((pc_val + 1) % 256)
         self.pc, _, self.pc_states = d_flip_flop_8bit_update(new_pc, sim_clock, self.pc_states)
+        # Store full 16-bit instruction for operand extraction
+        self.full_instr = instr
 
     def decode_execute(self, sim_clock, cycle_count):
         if self.halted:
             return
-        opcode = self.ir[4:]
-        operand = bits_to_int(self.ir[0:4])
+        opcode = self.ir[4:]  # 4-bit opcode from high byte
+        # Extract 8-bit operand from full instruction
+        operand = ((self.full_instr >> 4) & 0x0F) << 4 | (self.full_instr & 0xFF)
         op_name = opcode_to_name(opcode)
         print(f"Cycle {cycle_count}: PC={bits_to_int(self.pc)}, IR={bits_to_int(self.ir):02X}, Opcode={op_name}, Operand={operand}, A={bits_to_int(self.a_reg)}, Out={bits_to_int(self.out_reg)}, Zero={self.zero}, Greater={self.greater}, Less={self.less}")
 
@@ -317,6 +328,13 @@ class CPU:
         elif op_name == "JMP":
             new_pc = int_to_bits_8(operand)
             self.pc, _, self.pc_states = d_flip_flop_8bit_update(new_pc, sim_clock, self.pc_states)
+        elif op_name == "STG":
+            self.mar, _, self.mar_states = d_flip_flop_8bit_update(int_to_bits_8(operand), sim_clock, self.mar_states)
+            addr = bits_to_int(self.mar)
+            if 0 <= addr < len(self.ram):
+                self.bus = self.a_reg[:]
+                self.ram[addr] = bits_to_int(self.bus) & 0xFF
+                print(f"STG: Wrote {bits_to_int(self.bus)} to RAM[{addr:02X}]")
         elif op_name == "HLT":
             self.halted = True
             print("CPU Halted")
@@ -324,8 +342,8 @@ class CPU:
 # Real-time simulation with Pygame
 def real_time_computer_simulation(program, cycle_duration=2.0):
     pygame.init()
-    screen_width = 1000
-    screen_height = 800
+    screen_width = 1200
+    screen_height = 1000
     screen = pygame.display.set_mode((screen_width, screen_height))
     pygame.display.set_caption("8-Bit Computer Simulation")
     clock = pygame.time.Clock()
@@ -335,9 +353,10 @@ def real_time_computer_simulation(program, cycle_duration=2.0):
     RED = (255, 0, 0)
     GREEN = (0, 255, 0)
     YELLOW = (255, 255, 0)
+    GRAY = (100, 100, 100)
 
     font = pygame.font.SysFont('Arial', 18)
-    monitor_font = pygame.font.SysFont('Courier', 16)  # Monospace font for monitor
+    monitor_font = pygame.font.SysFont('Courier', 16)
 
     led_radius = 12
     led_spacing = 30
@@ -347,6 +366,19 @@ def real_time_computer_simulation(program, cycle_duration=2.0):
 
     labels = ["Clock", "PC [7:0]", "MAR [7:0]", "IR [7:0]", "A [7:0]", "B [7:0]", "Bus [7:0]", "Out [7:0]", "Carry", "Zero", "Greater", "Less"]
     led_counts = [1, 8, 8, 8, 8, 8, 8, 8, 1, 1, 1, 1]
+
+    graphic_x = 900
+    graphic_y = 100
+    pixel_size = 10
+    graphic_width = 8
+    graphic_height = 8
+    graphic_start_addr = 224  # 0xE0
+
+    # Memory viewer settings
+    bytes_per_row = 8
+    rows_per_page = 8
+    memory_page = 0
+    max_pages = (512 // (bytes_per_row * rows_per_page))  # 512 / (8 * 8) = 8 pages
 
     cpu = CPU(program)
     cycle_count = 0
@@ -369,6 +401,7 @@ def real_time_computer_simulation(program, cycle_duration=2.0):
                     cycle_start_ticks = pygame.time.get_ticks()
                     paused = False
                     fetch_phase = True
+                    memory_page = 0
                 elif event.key == pygame.K_p:
                     paused = not paused
                 elif event.key == pygame.K_q:
@@ -379,6 +412,10 @@ def real_time_computer_simulation(program, cycle_duration=2.0):
                 elif event.key == pygame.K_MINUS:
                     current_cycle_duration = max(100, current_cycle_duration - 500)
                     print(f"Cycle duration decreased to {current_cycle_duration / 1000:.1f}s")
+                elif event.key == pygame.K_UP:
+                    memory_page = max(0, memory_page - 1)
+                elif event.key == pygame.K_DOWN:
+                    memory_page = min(max_pages - 1, memory_page + 1)
 
         if not paused and not cpu.halted:
             current_ticks = pygame.time.get_ticks()
@@ -439,12 +476,11 @@ def real_time_computer_simulation(program, cycle_duration=2.0):
                 color = GREEN if state == 1 else RED
                 pygame.draw.circle(screen, color, (x, y), led_radius)
 
-        # 7-segment display
+        # 7-segment display (single digit for simplicity)
         out_decimal = bits_to_int(cpu.out_reg)
-        # print(f"Rendering 7-segment: out_decimal={out_decimal}")
-        draw_7_segment(screen, out_decimal // 100, 700, 500, scale=1.5)
-        draw_7_segment(screen, (out_decimal // 10) % 10, 750, 500, scale=1.5)
-        draw_7_segment(screen, out_decimal % 10, 800, 500, scale=1.5)
+        draw_7_segment(screen, out_decimal // 100, 850, 500, scale=1.5)
+        draw_7_segment(screen, (out_decimal // 10) % 10, 900, 500, scale=1.5)
+        draw_7_segment(screen, out_decimal % 10, 950, 500, scale=1.5)
 
         # Monitor display
         monitor_y = 50
@@ -457,30 +493,63 @@ def real_time_computer_simulation(program, cycle_duration=2.0):
             f"B: {bits_to_int(cpu.b_reg):02X} ({bits_to_int(cpu.b_reg)})",
             f"Out: {out_decimal:02X} ({out_decimal})",
             f"Flags: Z={cpu.zero} G={cpu.greater} L={cpu.less} C={cpu.carry}",
-            "RAM:",
+            "",
+            f"Memory Page: {memory_page} / {max_pages - 1} (Use Up/Down to navigate)",
+            f"RAM (0x{memory_page * bytes_per_row * rows_per_page:02X}-0x{(memory_page + 1) * bytes_per_row * rows_per_page - 1:02X}):",
         ]
-        for i in range(16):
-            monitor_lines.append(f"  {i:01X}: {cpu.ram[i]:02X} ({cpu.ram[i]})")
+        # Memory viewer: Display 8 rows of 8 bytes each
+        start_addr = memory_page * bytes_per_row * rows_per_page
+        for row in range(rows_per_page):
+            row_text = f"  {start_addr + row * bytes_per_row:02X}: "
+            for col in range(bytes_per_row):
+                addr = start_addr + row * bytes_per_row + col
+                if addr < 512:
+                    row_text += f"{cpu.ram[addr]:02X} "
+                else:
+                    row_text += "   "
+            monitor_lines.append(row_text)
+        # Add graphic RAM separately
+        monitor_lines.append("")
+        monitor_lines.append(f"Graphic RAM (0x{graphic_start_addr:02X}-0x{graphic_start_addr + 7:02X}):")
+        for i in range(8):
+            addr = graphic_start_addr + i
+            if addr < len(cpu.ram):
+                monitor_lines.append(f"  {addr:02X}: {cpu.ram[addr]:02X} ({cpu.ram[addr]})")
 
         for i, line in enumerate(monitor_lines):
             monitor_text = monitor_font.render(line, True, WHITE)
             screen.blit(monitor_text, (monitor_x, monitor_y + i * 20))
 
-        # Status and RAM display
-        ram_text = "RAM: " + " ".join(f"{i:01X}:{cpu.ram[i]:02X}" for i in range(16))
-        ram_display = font.render(ram_text, True, WHITE)
-        screen.blit(ram_display, (20, screen_height - 100))
+        # Graphic memory visualization (8x8 pixels)
+        graphic_label = font.render("Graphic Display", True, WHITE)
+        screen.blit(graphic_label, (graphic_x, graphic_y - 20))
+        for row in range(graphic_height):
+            addr = graphic_start_addr + row
+            if addr < len(cpu.ram):
+                byte = cpu.ram[addr]
+            else:
+                byte = 0
+            row_bits = int_to_bits_8(byte)
+            for col in range(graphic_width):
+                pixel = row_bits[7 - col]  # MSB first for left-to-right
+                color = WHITE if pixel == 1 else BLACK
+                pygame.draw.rect(screen, color, (graphic_x + col * pixel_size, graphic_y + row * pixel_size, pixel_size, pixel_size))
 
+        # Status bar
+        status_y = screen_height - 100
         op_name = opcode_to_name(cpu.ir[4:])
         info_text = font.render(f"Cycle: {cycle_count} | Instr: {op_name} | PC: {bits_to_int(cpu.pc)} | Out: {out_decimal} | Speed: {current_cycle_duration / 1000:.1f}s/cycle", True, WHITE)
-        screen.blit(info_text, (20, screen_height - 40))
+        screen.blit(info_text, (20, status_y))
 
         if paused:
-            status_text = font.render("Paused (Press 'p' to resume, 'q' to quit)", True, YELLOW)
-            screen.blit(status_text, (20, screen_height - 70))
+            status_text = font.render("Paused (Press 'p' to resume, 'q' to quit, 'r' to reset, Up/Down for memory)", True, YELLOW)
+            screen.blit(status_text, (20, status_y + 30))
         elif cpu.halted:
-            status_text = font.render("Halted (Press 'r' to reset, 'q' to quit)", True, YELLOW)
-            screen.blit(status_text, (20, screen_height - 70))
+            status_text = font.render("Halted (Press 'r' to reset, 'q' to quit, Up/Down for memory)", True, YELLOW)
+            screen.blit(status_text, (20, status_y + 30))
+        else:
+            status_text = font.render("Running (Press 'p' to pause, 'q' to quit, Up/Down for memory)", True, YELLOW)
+            screen.blit(status_text, (20, status_y + 30))
 
         pygame.display.flip()
         clock.tick(60)
@@ -488,6 +557,18 @@ def real_time_computer_simulation(program, cycle_duration=2.0):
     pygame.quit()
     sys.exit()
 
+
 if __name__ == "__main__":
-    program = "LDA 10; CMP 11; JNE 6; LDA 12; OUT; HLT; LDA 13; OUT; HLT"
+    program = """
+LDA 40; STG 224;
+LDA 41; STG 225;
+LDA 42; STG 226;
+LDA 43; STG 227;
+LDA 44; STG 228;
+LDA 43; STG 229;
+LDA 42; STG 230;
+LDA 41; STG 231; 
+LDA 40; STG 232;
+HLT
+"""
     real_time_computer_simulation(program, cycle_duration=2.0)
